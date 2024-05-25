@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-
 batch_size = 64
 block_size = 256
 learning_rate = 3e-4
@@ -59,7 +58,41 @@ def estimate_loss():
     model.train()
     return out
 
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim) -> None:
+        super().__init__()
+        theta = 10000.0
+        frequencies = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('frequencies', frequencies)
+    
+    def forward(self, seq_len):
+        t = torch.arange(seq_len, device=self.frequencies.device).float()
+        freqs = torch.einsum('i,j->ij', t, self.frequencies)
+        emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+        return emb
 
+    def apply_rotary_pos_emb(self, q, k):
+        seq_len, dim = q.shape[1], q.shape[2]
+        cos, sin = self(seq_len)[:, 0::2], self(seq_len)[:, 1::2]  # Separate sine and cosine
+        cos, sin = cos.to(q.device), sin.to(q.device)
+
+        # Expand cos and sin for each element in the batch and head dimension
+        cos = cos.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
+        sin = sin.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
+
+        # Apply RoPE to q and k
+        q_r, q_i = q[..., 0::2], q[..., 1::2]
+        k_r, k_i = k[..., 0::2], k[..., 1::2]
+
+        q_rot = q_r * cos + q_i * sin
+        k_rot = k_r * cos - k_i * sin
+
+        # Re-assemble the transformed q and k
+        q_transformed = torch.stack([q_rot, q_i - q_rot * sin], dim=-1).reshape_as(q)
+        k_transformed = torch.stack([k_rot, k_i - k_rot * sin], dim=-1).reshape_as(k)
+
+        return q_transformed, k_transformed
+    
 class Head(nn.Module):
     """one head self-attention"""
 
@@ -73,14 +106,21 @@ class Head(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
         self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionEmbedding(head_size)
 
     def forward(self, x):
         B, T, C = x.shape
         q = self.query(x)  # (B, T, C)
         k = self.key(x)
         v = self.value(x)
+
+        # Apply RoPE to queries and keys
+        rope = self.rope(T).unsqueeze(0).repeat(B, 1, 1) # (T, C) -> (1, T, C) -> (B, T, C)
+        q, k = self.rope.apply_rotary_pos_emb(q, k)
+
         wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
         out = wei @ v
         return out
@@ -159,7 +199,6 @@ class GPTLanguageModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.tok_embedding = nn.Embedding(vocab_size, n_embd)
-        self.pos_embedding = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_heads) for _ in range(n_layers)])
         self.ln_f = LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
@@ -177,7 +216,7 @@ class GPTLanguageModel(nn.Module):
     def forward(self, idx, targets=None):
         B, T= idx.shape
         out = self.tok_embedding(idx)
-        out = out + self.pos_embedding(torch.arange(T, device=device))
+
         out = self.blocks(out)
         out = self.ln_f(out)
         logits = self.lm_head(out)

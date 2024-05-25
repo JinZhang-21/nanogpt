@@ -61,83 +61,121 @@ def estimate_loss():
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim) -> None:
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float()/dim))
-        self.register_buffer('inv_freq', inv_freq)
+        theta = 10000.0
+        frequencies = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('frequencies', frequencies)
     
     def forward(self, seq_len):
-        """生成sin/cos旋转注位置编码"""
-        t = torch.arange(seq_len, device=device).float()
-        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        t = torch.arange(seq_len, device=self.frequencies.device).float()
+        freqs = torch.einsum('i,j->ij', t, self.frequencies)
         emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         return emb
 
-    def apply_rotary_pos_emb(self, q, k, rope):
-        # rope:[batch_size, seq_len, dim]
-        q_cos, q_sin = rope[:, :, 1::2].repeat_interleave(2, dim=-1), rope[:, :, ::2].repeat_interleave(2, dim=-1)
-        k_cos, k_sin = rope[:, :, 1::2].repeat_interleave(2, dim=-1), rope[:, :, ::2].repeat_interleave(2, dim=-1)
+    def apply_rotary_pos_emb(self, q, k):
+        seq_len, dim = q.shape[1], q.shape[2]
+        cos, sin = self(seq_len)[:, 0::2], self(seq_len)[:, 1::2]  # Separate sine and cosine
+        cos, sin = cos.to(q.device), sin.to(q.device)
 
-        q_rot = (q * q_cos) + (q * q_sin)
-        k_rot = (k * k_cos) + (k * k_sin)
+        # Expand cos and sin for each element in the batch and head dimension
+        cos = cos.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
+        sin = sin.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
 
-        return q_rot, k_rot
+        # Apply RoPE to q and k
+        q_r, q_i = q[..., 0::2], q[..., 1::2]
+        k_r, k_i = k[..., 0::2], k[..., 1::2]
+
+        q_rot = q_r * cos + q_i * sin
+        k_rot = k_r * cos - k_i * sin
+
+        # Re-assemble the transformed q and k
+        q_transformed = torch.stack([q_rot, q_i - q_rot * sin], dim=-1).reshape_as(q)
+        k_transformed = torch.stack([k_rot, k_i - k_rot * sin], dim=-1).reshape_as(k)
+
+        return q_transformed, k_transformed
     
 class Head(nn.Module):
-    """one head self-attention"""
-
-    def __init__(self, head_size) -> None:
+    """One head self-attention with KV-Cache."""
+    def __init__(self, head_size):
         super().__init__()
-        # nn.Linear: 接受连续值的特征向量作为输入。
-        # nn.Embedding: 接受离散的索引值作为输入。
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryPositionEmbedding(head_size)
+        
+        # Cache for keys and values
+        self.register_buffer("cache_k", torch.zeros(0, 0, head_size))
+        self.register_buffer("cache_v", torch.zeros(0, 0, head_size))
 
-    def forward(self, x):
+    def forward(self, x, use_cache=True):
         B, T, C = x.shape
-        q = self.query(x)  # (B, T, C)
+        q = self.query(x)
         k = self.key(x)
         v = self.value(x)
 
         # Apply RoPE to queries and keys
-        rope = self.rope(T).unsqueeze(0).repeat(B, 1, 1) # (T, C) -> (1, T, C) -> (B, T, C)
-        q, k = self.rope.apply_rotary_pos_emb(q, k, rope)
+        q, k = self.rope.apply_rotary_pos_emb(q, k)
 
-        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+        # Concatenate with cache if use_cache is True
+        if use_cache and self.cache_k.size(1) > 0:
+            k = torch.cat([self.cache_k, k], dim=1)
+            v = torch.cat([self.cache_v, v], dim=1)
+
+        # Create dynamic triangular mask
+        combined_len = k.shape[1]
+        assert combined_len == v.shape[1] & combined_len == k.shape[1] # Check if the combined length is the same
+        tril = torch.tril(torch.ones(combined_len, combined_len, device=x.device))
+
+        # Debug print to check sizes
+        # print(f"Q size: {q.shape}, K size: {k.shape}, Combined length: {combined_len}")
+        
+        wei = q @ k.transpose(-2, -1) * C ** -0.5
+        wei = wei.masked_fill(tril[:T, :combined_len] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
         out = wei @ v
+        
+        # Update cache
+        self.cache_k = k
+        self.cache_v = v
+        
         return out
 
 
 class MultiHeadAttention(nn.Module):
-    """multiple heads of self-attention in parallel"""
-
+    """Multiple heads of self-attention in parallel with KV-Cache."""
     def __init__(self, n_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
         self.proj = nn.Linear(head_size * n_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
+    def forward(self, x, use_cache=True):
+        out = torch.cat([head(x, use_cache) for head in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
 
+class SwiGLU(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, output_dim * 2)
+        self.fc2 = nn.Linear(output_dim, output_dim)  # Adjusted to match the expected dimension post-gate
+
+    def forward(self, x):
+        x = F.silu(self.fc1(x))  # Swish activation
+        gate, value = x.chunk(2, dim=-1)
+        return self.fc2(gate * value)  # GLU part
+
+
 
 class FeedForward(nn.Module):
-    """a simple linear layer followed by a non-linearity"""
+    """Implements FeedForward Network with SwiGLU."""
 
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd * 4),
-            nn.ReLU(),
-            nn.Linear(n_embd * 4, n_embd),
+            SwiGLU(n_embd, n_embd * 4),
+            nn.Linear(n_embd * 4, n_embd),  # Ensure this layer maps back to n_embd
             nn.Dropout(dropout),
         )
 
@@ -166,19 +204,21 @@ class LayerNorm(nn.Module):
 
 
 class Block(nn.Module):
-    """transformer layer"""
+    """Transformer layer"""
 
     def __init__(self, n_embd, n_heads) -> None:
         super().__init__()
         self.mha = MultiHeadAttention(n_heads, n_embd // n_heads)
-        self.ffn = FeedForward(n_embd)
+        self.ffn = FeedForward(n_embd)  # Ensures the FeedForward net returns the correct size
         self.ln1 = LayerNorm(n_embd)
         self.ln2 = LayerNorm(n_embd)
 
     def forward(self, x):
-        out = self.mha(self.ln1(x)) + x
-        out = self.ffn(self.ln1(x)) + x
-        return out
+        x1 = self.ln1(x)
+        x = x + self.mha(x1)
+        x2 = self.ln2(x)
+        x = x + self.ffn(x2)
+        return x
 
 
 class GPTLanguageModel(nn.Module):
