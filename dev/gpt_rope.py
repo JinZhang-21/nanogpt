@@ -1,19 +1,36 @@
+from math import e
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-batch_size = 64
-block_size = 256
+
+# ------------Config for Debugging-------------------
+batch_size = 4
+block_size = 8
 learning_rate = 3e-4
-max_iters = 5000
-eval_interval = 500
-eval_iters = 200
+max_iters = 50
+eval_interval = 5
+eval_iters = 2
 dropout = 0.2
-n_layers = 6
-n_heads = 6
-n_embd = 384
+n_layers = 2
+n_heads = 4
+n_embd = 256
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # -------------------------
+
+# # -------------------------------
+# batch_size = 64
+# block_size = 256
+# learning_rate = 3e-4
+# max_iters = 5000
+# eval_interval = 500
+# eval_iters = 200
+# dropout = 0.2
+# n_layers = 6
+# n_heads = 6
+# n_embd = 384
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# # -------------------------
 
 torch.manual_seed(43)
 
@@ -59,40 +76,31 @@ def estimate_loss():
     return out
 
 class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim) -> None:
+    def __init__(self, dim, seq_len, theta: float=10000.0) -> None:
         super().__init__()
-        theta = 10000.0
-        frequencies = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('frequencies', frequencies)
-    
-    def forward(self, seq_len):
-        t = torch.arange(seq_len, device=self.frequencies.device).float()
-        freqs = torch.einsum('i,j->ij', t, self.frequencies)
-        emb = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
-        return emb
+        # 10000 is the cycle length, expected to be 10k > seq_len
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim//2)].float() / dim)) # (D/2,)
+        t = torch.arange(seq_len)
+        freqs = torch.einsum('i,j->ij', t, freqs) # (T, D/2)
+        # torch.polar(abs, angle) -> (abs * cos(angle)+iabs * sin(angle))
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # (T, D/2)
+        self.register_buffer('freqs_cis', freqs_cis)
 
     def apply_rotary_pos_emb(self, q, k):
-        seq_len, dim = q.shape[1], q.shape[2]
-        cos, sin = self(seq_len)[:, 0::2], self(seq_len)[:, 1::2]  # Separate sine and cosine
-        cos, sin = cos.to(q.device), sin.to(q.device)
+        freqs_cis = self.freqs_cis[:q.shape[1]] # (T, D/2)
+        
+        q_ = q.float().reshape(*q.shape[:-1], -1, 2) # (B, T, D) -> (B, T, D/2, 2)
+        k_ = k.float().reshape(*k.shape[:-1], -1, 2) # (B, T, D) -> (B, T, D/2, 2)
+        
+        # torch.view_as_complex((x, y)) -> x + iy
+        q_ = torch.view_as_complex(q_)
+        k_ = torch.view_as_complex(k_)
+        
+        # torch.view_as_real(x+iy) -> (x, y)
+        q_out = torch.view_as_real(q_ * freqs_cis).flatten(2) # (B, T, D/2, 2) -> (B, T, D)
+        k_out = torch.view_as_real(k_ * freqs_cis).flatten(-2) # (B, T, D/2, 2) -> (B, T, D)
+        return q_out.type_as(q), k_out.type_as(k)
 
-        # Expand cos and sin for each element in the batch and head dimension
-        cos = cos.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
-        sin = sin.unsqueeze(0).repeat(q.shape[0], 1, 1)  # (B, T, D/2)
-
-        # Apply RoPE to q and k
-        q_r, q_i = q[..., 0::2], q[..., 1::2]
-        k_r, k_i = k[..., 0::2], k[..., 1::2]
-
-        q_rot = q_r * cos + q_i * sin
-        k_rot = k_r * cos - k_i * sin
-
-        # Re-assemble the transformed q and k
-        q_transformed = torch.stack([q_rot, q_i - q_rot * sin], dim=-1).reshape_as(q)
-        k_transformed = torch.stack([k_rot, k_i - k_rot * sin], dim=-1).reshape_as(k)
-
-        return q_transformed, k_transformed
-    
 class Head(nn.Module):
     """one head self-attention"""
 
@@ -106,7 +114,7 @@ class Head(nn.Module):
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
         self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionEmbedding(head_size)
+        self.rope = RotaryPositionEmbedding(head_size, block_size)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -115,13 +123,16 @@ class Head(nn.Module):
         v = self.value(x)
 
         # Apply RoPE to queries and keys
-        rope = self.rope(T).unsqueeze(0).repeat(B, 1, 1) # (T, C) -> (1, T, C) -> (B, T, C)
         q, k = self.rope.apply_rotary_pos_emb(q, k)
 
         wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
+
+        # Ensure wei and v are compatible for matrix multiplication
+        assert wei.shape[-1] == v.shape[-2], f"wei.shape: {wei.shape}, v.shape: {v.shape}"
+
         out = wei @ v
         return out
 
@@ -231,9 +242,9 @@ class GPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
+    # todo: robustness needed
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            # idx_cond = idx[:, -block_size:, :]
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
@@ -264,5 +275,6 @@ for iter in range(max_iters):
     optimizer.step()
 
 # generate from model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
+context = torch.tensor(encode("The meaning of life is"), dtype=torch.long, device=device).unsqueeze(0)
+# context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
