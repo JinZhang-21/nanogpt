@@ -1,4 +1,3 @@
-from math import e
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -130,9 +129,6 @@ class Head(nn.Module):
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
 
-        # Ensure wei and v are compatible for matrix multiplication
-        assert wei.shape[-1] == v.shape[-2], f"wei.shape: {wei.shape}, v.shape: {v.shape}"
-
         out = wei @ v
         return out
 
@@ -242,6 +238,10 @@ class GPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
+    def greedy_search(self, logits):
+        logits = logits[:, -1, :]
+        
+    
     # todo: robustness needed
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
